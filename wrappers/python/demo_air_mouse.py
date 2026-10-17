@@ -11,7 +11,7 @@ Wayland (Raspberry Pi OS Bookworm). This needs python3-evdev and write access
 to /dev/uinput (run with sudo, or see the udev rule printed by --help).
 
     python3 demo_air_mouse.py --width 1920 --height 1080 --preview
-    python3 demo_air_mouse.py --dry-run          # print events, no mouse
+    python3 demo_air_mouse.py --dry-run          # print status + events, no mouse
 """
 import argparse
 import math
@@ -26,6 +26,21 @@ import freenect
 # Kinect v1 depth camera intrinsics at 640x480 (approximate)
 FOCAL_PX = 580.0
 CX, CY = 320.0, 240.0
+
+# On a terminal the dry-run status line is redrawn in place; events print above it
+_TTY = sys.stdout.isatty()
+
+
+def log(msg):
+    """Print an event line without mangling the in-place status line."""
+    print(("\r\033[K" if _TTY else "") + msg, flush=True)
+
+
+def status(msg):
+    if _TTY:
+        print("\r\033[K" + msg, end="", flush=True)
+    else:
+        print(msg, flush=True)
 
 
 class OneEuroFilter:
@@ -90,7 +105,7 @@ class Pointer:
 
     def click(self, x, y):
         if self.dry_run:
-            print("CLICK at %4d,%4d" % (x, y))
+            log("CLICK at %4d,%4d" % (x, y))
             return
         self.move(x, y)
         self.ui.write(self.e.EV_KEY, self.e.BTN_LEFT, 1)
@@ -143,7 +158,9 @@ def main():
     p.add_argument("--push-mm", type=float, default=100, help="forward travel that counts as a press, mm")
     p.add_argument("--push-time", type=float, default=0.35, help="time window for the push, s")
     p.add_argument("--no-mirror", action="store_true", help="use if the cursor moves opposite to your hand")
-    p.add_argument("--dry-run", action="store_true", help="print clicks instead of moving the mouse")
+    p.add_argument("--dry-run", action="store_true",
+                   help="don't move the mouse; print hand/cursor status and clicks instead")
+    p.add_argument("--status-hz", type=float, default=5, help="dry-run status lines per second")
     p.add_argument("--preview", action="store_true", help="show a debug window (needs python3-opencv)")
     args = p.parse_args()
 
@@ -163,6 +180,8 @@ def main():
     lost_since = None
     sx = sy = 0.0
     step = 2                   # downsample 640x480 -> 320x240 for speed
+    last_status = 0.0
+    frames = 0
 
     print("Raise a hand towards the screen. Push forward to click. Ctrl+C to quit.")
     try:
@@ -182,7 +201,7 @@ def main():
                     center = None
                     fx.reset(); fy.reset(); history.clear()
                     armed = True
-                    print("hand lost")
+                    log("hand lost")
             else:
                 lost_since = None
                 u, v, z, mask = hand
@@ -191,7 +210,7 @@ def main():
                 y_mm = (v * step - CY) * z / FOCAL_PX
                 if center is None:
                     center = (x_mm, y_mm)
-                    print("hand engaged at %.0f mm" % z)
+                    log("hand engaged at %.0f mm" % z)
 
                 dx = (x_mm - center[0]) / args.box_w
                 dy = (y_mm - center[1]) / args.box_h
@@ -218,6 +237,20 @@ def main():
                 elif not armed and z > rest_z + args.push_mm * 0.5:
                     armed = True
 
+            frames += 1
+            if args.dry_run and t - last_status >= 1.0 / args.status_hz:
+                fps = frames / (t - last_status) if last_status else 0.0
+                last_status, frames = t, 0
+                if hand is not None:
+                    status("hand %4.0f mm | cursor %4d,%4d | push %3.0f/%.0f mm | %s | %4.1f fps"
+                           % (hand[2], sx, sy, max(travel, 0), args.push_mm,
+                              "ready   " if armed else "released", fps))
+                else:
+                    valid = depth[(depth > args.min_dist) & (depth < args.max_dist)]
+                    nearest = "%4.0f mm" % np.percentile(valid, 0.5) if valid.size else "   none"
+                    status("no hand | nearest object %s (range %.0f-%.0f mm) | %4.1f fps"
+                           % (nearest, args.min_dist, args.max_dist, fps))
+
             if cv2 is not None:
                 vis = np.clip(depth / args.max_dist * 255, 0, 255).astype(np.uint8)
                 vis = cv2.cvtColor(255 - vis, cv2.COLOR_GRAY2BGR)
@@ -230,6 +263,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if args.dry_run and _TTY:
+            print()
         pointer.close()
         freenect.sync_stop()
 
